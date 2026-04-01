@@ -12,14 +12,14 @@ COPY settings.gradle build.gradle ./
 
 RUN chmod +x gradlew
 
-RUN --mount=type=cache,target=/root/.gradle \
+RUN --mount=type=cache,id=gradle-cache,target=/root/.gradle \
     ./gradlew --no-daemon dependencies >/dev/null 2>&1 || true
 
 COPY src ./src
 COPY application.yml ./
 COPY logback-spring.xml ./
 
-RUN --mount=type=cache,target=/root/.gradle \
+RUN --mount=type=cache,id=gradle-cache,target=/root/.gradle \
     ./gradlew --no-daemon clean bootJar -x test
 
 FROM eclipse-temurin:17-jre-jammy
