@@ -3,6 +3,8 @@
 FROM eclipse-temurin:17-jdk-jammy AS builder
 
 WORKDIR /workspace
+ENV JAVA_HOME=/opt/java/openjdk
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 COPY gradlew ./
 COPY gradle ./gradle
@@ -23,6 +25,8 @@ RUN --mount=type=cache,target=/root/.gradle \
 FROM eclipse-temurin:17-jre-jammy
 
 WORKDIR /app
+ENV JAVA_HOME=/opt/java/openjdk
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 RUN groupadd --system app && useradd --system --gid app --create-home app
 
