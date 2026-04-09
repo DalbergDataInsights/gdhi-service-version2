@@ -7,7 +7,7 @@ import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 
 @RestController
-@RequestMapping("/api/ai")
+@RequestMapping("/ai")
 public class AiController {
 
     private final GdhmAiService aiService;

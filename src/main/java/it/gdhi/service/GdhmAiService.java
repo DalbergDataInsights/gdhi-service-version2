@@ -6,60 +6,263 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import software.amazon.awssdk.services.bedrockagentruntime.BedrockAgentRuntimeAsyncClient;
+import software.amazon.awssdk.services.bedrockagentruntime.model.ActionGroupInvocationInput;
+import software.amazon.awssdk.services.bedrockagentruntime.model.DependencyFailedException;
 import software.amazon.awssdk.services.bedrockagentruntime.model.InvokeAgentRequest;
 import software.amazon.awssdk.services.bedrockagentruntime.model.InvokeAgentResponseHandler;
+import software.amazon.awssdk.services.bedrockagentruntime.model.Observation;
+import software.amazon.awssdk.services.bedrockagentruntime.model.ReturnControlPayload;
+import software.amazon.awssdk.services.bedrockagentruntime.model.SessionState;
+import software.amazon.awssdk.services.bedrockagentruntime.model.Trace;
+import software.amazon.awssdk.services.bedrockagentruntime.model.TracePart;
 
 import java.util.Optional;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static it.gdhi.utils.LanguageCode.USER_LANGUAGE;
 
 @Slf4j
 @Service
 public class GdhmAiService {
 
     private final BedrockAgentRuntimeAsyncClient client;
+    private final BedrockReturnControlService returnControlService;
     private final String agentId;
     private final String agentAliasId;
+    private final int maxModelRetryAttempts;
+    private final boolean enableTrace;
+    private final int applyGuardrailInterval;
+    private final boolean logFullTrace;
 
     public GdhmAiService(
             BedrockAgentRuntimeAsyncClient client,
+            BedrockReturnControlService returnControlService,
             @Value("${aws.bedrock.agentId}") String agentId,
-            @Value("${aws.bedrock.agentAliasId}") String agentAliasId) {
+            @Value("${aws.bedrock.agentAliasId}") String agentAliasId,
+            @Value("${aws.bedrock.maxModelRetryAttempts:2}") int maxModelRetryAttempts,
+            @Value("${aws.bedrock.enableTrace:true}") boolean enableTrace,
+            @Value("${aws.bedrock.applyGuardrailInterval:20}") int applyGuardrailInterval,
+            @Value("${aws.bedrock.logFullTrace:false}") boolean logFullTrace) {
         this.client = client;
+        this.returnControlService = returnControlService;
         this.agentId = agentId;
         this.agentAliasId = agentAliasId;
+        this.maxModelRetryAttempts = maxModelRetryAttempts;
+        this.enableTrace = enableTrace;
+        this.applyGuardrailInterval = applyGuardrailInterval;
+        this.logFullTrace = logFullTrace;
     }
 
     public Flux<String> streamChat(AIRequest userQuery) {
         String sessionId = Optional.ofNullable(userQuery.getResponseId())
                 .map(String::trim)
                 .orElseThrow(() -> new IllegalArgumentException("Session ID (ResponseId) cannot be null"));
+        String query = userQuery.getQuery();
+        String userLanguage = resolveUserLanguage(userQuery);
 
-        InvokeAgentRequest request = InvokeAgentRequest.builder()
-                .agentId(agentId)
-                .agentAliasId(agentAliasId)
-                .sessionId(sessionId)
-                .inputText(userQuery.getQuery())
-                .streamingConfigurations(sc -> sc
-                        .streamFinalResponse(true)
-                        .applyGuardrailInterval(3))
+        log.info("Starting Bedrock agent sessionId={} queryLength={} userLanguage={}", sessionId,
+                query == null ? 0 : query.length(), userLanguage);
+        return Flux.create(sink -> invokeAgent(buildPromptRequest(sessionId, query, userLanguage), sink,
+                userLanguage, new StringBuffer(), 1));
+    }
+
+    private void invokeAgent(InvokeAgentRequest request, FluxSink<String> sink, String userLanguage,
+                             StringBuffer fullResponse, int attemptNumber) {
+        AtomicReference<ReturnControlPayload> pendingReturnControl = new AtomicReference<>();
+
+        InvokeAgentResponseHandler handler = InvokeAgentResponseHandler.builder()
+                .onError(error -> handleInvokeError(request, error, sink, userLanguage, fullResponse, attemptNumber))
+                .onComplete(() -> continueOrComplete(request.sessionId(), pendingReturnControl.get(), sink,
+                        userLanguage, fullResponse))
+                .subscriber(InvokeAgentResponseHandler.Visitor.builder()
+                        .onChunk(chunk -> {
+                            String text = chunk.bytes().asUtf8String();
+                            if (StringUtils.hasText(text)) {
+                                fullResponse.append(text);
+                                sink.next(text);
+                            }
+                        })
+                        .onTrace(this::logTracePart)
+                        .onReturnControl(pendingReturnControl::set)
+                        .onDefault(event -> log.debug("Received Bedrock event: {}", event.sdkEventType()))
+                        .build())
                 .build();
 
-        return Flux.create(sink -> {
-            InvokeAgentResponseHandler handler = InvokeAgentResponseHandler.builder()
-                    .onError(sink::error)
-                    .onComplete(sink::complete)
-                    .subscriber(InvokeAgentResponseHandler.Visitor.builder()
-                            .onChunk(chunk -> {
-                                String text = chunk.bytes().asUtf8String();
-                                if (StringUtils.hasText(text)) {
-                                    sink.next(text);
-                                }
-                            })
-                            .onDefault(event -> log.debug("Received Bedrock event: {}", event.sdkEventType()))
-                            .build())
-                    .build();
+        log.info("Invoking Bedrock agent sessionId={} returnControlResultsPresent={} attempt={}",
+                request.sessionId(),
+                request.sessionState() != null && request.sessionState().hasReturnControlInvocationResults(),
+                attemptNumber);
+        client.invokeAgent(request, handler);
+    }
 
-            client.invokeAgent(request, handler);
-        });
+    private void continueOrComplete(String sessionId, ReturnControlPayload payload, FluxSink<String> sink,
+                                    String userLanguage, StringBuffer fullResponse) {
+        if (payload == null) {
+            log.info("Bedrock agent sessionId={} completed without further return control", sessionId);
+            sink.complete();
+            return;
+        }
+
+        try {
+            log.info("Bedrock agent sessionId={} returned control invocationId={} inputs={}",
+                    sessionId, payload.invocationId(), payload.invocationInputs().size());
+            SessionState sessionState = returnControlService.buildSessionState(payload, userLanguage);
+            invokeAgent(buildReturnControlRequest(sessionId, sessionState), sink, userLanguage, fullResponse, 1);
+        }
+        catch (Exception ex) {
+            log.error("Failed while handling Bedrock return control for sessionId={}", sessionId, ex);
+            finishWithVisibleError(sink, fullResponse, ex);
+        }
+    }
+
+    private InvokeAgentRequest buildPromptRequest(String sessionId, String inputText, String userLanguage) {
+        return baseRequestBuilder(sessionId)
+                .inputText(buildInputText(inputText, userLanguage))
+                .sessionState(buildLanguageSessionState(userLanguage))
+                .build();
+    }
+
+    private InvokeAgentRequest buildReturnControlRequest(String sessionId, SessionState sessionState) {
+        return baseRequestBuilder(sessionId)
+                .sessionState(sessionState)
+                .build();
+    }
+
+    private InvokeAgentRequest.Builder baseRequestBuilder(String sessionId) {
+        return InvokeAgentRequest.builder()
+                .agentId(agentId)
+                .agentAliasId(agentAliasId)
+                .enableTrace(enableTrace)
+                .sessionId(sessionId)
+                .streamingConfigurations(sc -> sc
+                        .streamFinalResponse(true)
+                        .applyGuardrailInterval(applyGuardrailInterval));
+    }
+
+    private SessionState buildLanguageSessionState(String userLanguage) {
+        return SessionState.builder()
+                .sessionAttributes(Map.of(USER_LANGUAGE, userLanguage))
+                .promptSessionAttributes(Map.of(USER_LANGUAGE, userLanguage))
+                .build();
+    }
+
+    private String buildInputText(String inputText, String userLanguage) {
+        String query = inputText == null ? "" : inputText.trim();
+        return """
+                Preferred response language: %s.
+                Use this language for the full answer and for tool parameters when supported.
+
+                User request:
+                %s
+                """.formatted(userLanguage, query);
+    }
+
+    private String resolveUserLanguage(AIRequest userQuery) {
+        String userLanguage = Optional.ofNullable(userQuery.getUserLanguage()).map(String::trim).orElse("en");
+        return StringUtils.hasText(userLanguage) ? userLanguage : "en";
+    }
+
+    private void handleInvokeError(InvokeAgentRequest request, Throwable error, FluxSink<String> sink,
+                                   String userLanguage, StringBuffer fullResponse, int attemptNumber) {
+        String sessionId = request.sessionId();
+        if (shouldRetry(error, fullResponse, attemptNumber)) {
+            log.warn("Retrying Bedrock agent sessionId={} after dependency failure attempt={}/{}", sessionId,
+                    attemptNumber, maxModelRetryAttempts, error);
+            invokeAgent(request, sink, userLanguage, fullResponse, attemptNumber + 1);
+            return;
+        }
+
+        log.error("Bedrock agent invocation failed for sessionId={} on attempt={}", sessionId, attemptNumber, error);
+        finishWithVisibleError(sink, fullResponse, error);
+    }
+
+    private boolean shouldRetry(Throwable error, StringBuffer fullResponse, int attemptNumber) {
+        return error instanceof DependencyFailedException
+                && fullResponse.length() == 0
+                && attemptNumber < maxModelRetryAttempts;
+    }
+
+    private void finishWithVisibleError(FluxSink<String> sink, StringBuffer fullResponse, Throwable error) {
+        String visibleMessage = userVisibleErrorMessage(error);
+        if (fullResponse.length() > 0) {
+            fullResponse.append("\n\n").append(visibleMessage);
+        }
+        else {
+            fullResponse.append(visibleMessage);
+        }
+        if (!sink.isCancelled()) {
+            sink.next(visibleMessage);
+        }
+        sink.complete();
+    }
+
+    private String userVisibleErrorMessage(Throwable error) {
+        if (error instanceof DependencyFailedException) {
+            return "I'm having trouble getting a response from Bedrock right now. Please try the same question again in a moment.";
+        }
+        return "I ran into a temporary problem while generating the answer. Please try again.";
+    }
+
+    private void logTracePart(TracePart tracePart) {
+        Trace trace = tracePart.trace();
+        if (trace == null) {
+            log.info("Bedrock trace sessionId={} received empty trace event", tracePart.sessionId());
+            return;
+        }
+
+        if (trace.failureTrace() != null) {
+            log.warn("Bedrock trace sessionId={} phase=failure traceId={} reason={}",
+                    tracePart.sessionId(),
+                    trace.failureTrace().traceId(),
+                    trace.failureTrace().failureReason());
+        }
+        else if (trace.preProcessingTrace() != null) {
+            log.info("Bedrock trace sessionId={} phase=pre-processing type={} traceId={}",
+                    tracePart.sessionId(),
+                    trace.preProcessingTrace().type(),
+                    trace.preProcessingTrace().modelInvocationOutput() == null
+                            ? null
+                            : trace.preProcessingTrace().modelInvocationOutput().traceId());
+        }
+        else if (trace.orchestrationTrace() != null) {
+            logOrchestrationTrace(tracePart.sessionId(), trace.orchestrationTrace().observation(),
+                    trace.orchestrationTrace().invocationInput(), trace.orchestrationTrace().type().toString());
+        }
+        else if (trace.postProcessingTrace() != null) {
+            log.info("Bedrock trace sessionId={} phase=post-processing type={}",
+                    tracePart.sessionId(),
+                    trace.postProcessingTrace().type());
+        }
+        else {
+            log.info("Bedrock trace sessionId={} phase={} details=unclassified",
+                    tracePart.sessionId(), trace.type());
+        }
+
+        if (logFullTrace) {
+            log.info("Bedrock full trace sessionId={} payload={}", tracePart.sessionId(), trace);
+        }
+    }
+
+    private void logOrchestrationTrace(String sessionId, Observation observation,
+                                       software.amazon.awssdk.services.bedrockagentruntime.model.InvocationInput invocationInput,
+                                       String orchestrationType) {
+        ActionGroupInvocationInput actionGroupInvocationInput =
+                invocationInput == null ? null : invocationInput.actionGroupInvocationInput();
+        String actionGroupName = actionGroupInvocationInput == null ? null : actionGroupInvocationInput.actionGroupName();
+        String apiPath = actionGroupInvocationInput == null ? null : actionGroupInvocationInput.apiPath();
+        String verb = actionGroupInvocationInput == null ? null : actionGroupInvocationInput.verb();
+
+        log.info("Bedrock trace sessionId={} phase=orchestration orchestrationType={} observationType={} invocationType={} actionGroup={} verb={} apiPath={} traceId={}",
+                sessionId,
+                orchestrationType,
+                observation == null ? null : observation.typeAsString(),
+                invocationInput == null ? null : invocationInput.invocationTypeAsString(),
+                actionGroupName,
+                verb,
+                apiPath,
+                observation == null ? null : observation.traceId());
     }
 }

@@ -28,6 +28,7 @@ import lombok.Getter;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import static it.gdhi.controller.strategy.FilterStrategy.getCategoryPhaseFilter;
 import static it.gdhi.controller.strategy.FilterStrategy.getCountryPhaseFilter;
@@ -40,6 +41,7 @@ import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.toList;
 
 @Service
+@Transactional(readOnly = true)
 public class CountryHealthIndicatorService {
 
     @Autowired
