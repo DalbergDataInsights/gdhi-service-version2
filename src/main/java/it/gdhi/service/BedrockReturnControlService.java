@@ -16,6 +16,7 @@ import software.amazon.awssdk.services.bedrockagentruntime.model.ReturnControlPa
 import software.amazon.awssdk.services.bedrockagentruntime.model.SessionState;
 import software.amazon.awssdk.services.bedrockagentruntime.model.ResponseState;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
@@ -25,6 +26,8 @@ import static it.gdhi.utils.LanguageCode.USER_LANGUAGE;
 @Slf4j
 @Service
 public class BedrockReturnControlService {
+
+    private static final int LARGE_TOOL_RESPONSE_BYTES = 25_000;
 
     private final BedrockToolsService bedrockToolsService;
     private final ObjectMapper objectMapper;
@@ -79,12 +82,14 @@ public class BedrockReturnControlService {
 
     private ApiResult buildApiResult(ApiInvocationInput apiInvocationInput, int httpStatusCode,
                                      BedrockToolResponse<?> responseBody, ResponseState responseState) {
+        String serializedBody = serialize(responseBody);
+        logToolResponseSize(apiInvocationInput, httpStatusCode, serializedBody);
         ApiResult.Builder resultBuilder = ApiResult.builder()
                 .actionGroup(apiInvocationInput.actionGroup())
                 .apiPath(apiInvocationInput.apiPath())
                 .httpMethod(apiInvocationInput.httpMethod())
                 .httpStatusCode(httpStatusCode)
-                .responseBody(Map.of("application/json", ContentBody.builder().body(serialize(responseBody)).build()));
+                .responseBody(Map.of("application/json", ContentBody.builder().body(serializedBody).build()));
 
         if (responseState != null) {
             resultBuilder.responseState(responseState);
@@ -95,6 +100,20 @@ public class BedrockReturnControlService {
         }
 
         return resultBuilder.build();
+    }
+
+    private void logToolResponseSize(ApiInvocationInput apiInvocationInput, int httpStatusCode, String serializedBody) {
+        int sizeBytes = serializedBody.getBytes(StandardCharsets.UTF_8).length;
+        if (sizeBytes >= LARGE_TOOL_RESPONSE_BYTES) {
+            log.warn("Large Bedrock tool response actionGroup={} method={} path={} status={} responseBytes={}",
+                    apiInvocationInput.actionGroup(), apiInvocationInput.httpMethod(), apiInvocationInput.apiPath(),
+                    httpStatusCode, sizeBytes);
+            return;
+        }
+
+        log.info("Bedrock tool response actionGroup={} method={} path={} status={} responseBytes={}",
+                apiInvocationInput.actionGroup(), apiInvocationInput.httpMethod(), apiInvocationInput.apiPath(),
+                httpStatusCode, sizeBytes);
     }
 
     private String serialize(BedrockToolResponse<?> body) {

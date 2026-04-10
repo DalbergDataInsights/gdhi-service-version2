@@ -20,6 +20,7 @@ import software.amazon.awssdk.services.bedrockagentruntime.model.TracePart;
 
 import java.util.Optional;
 import java.util.Map;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static it.gdhi.utils.LanguageCode.USER_LANGUAGE;
@@ -114,7 +115,7 @@ public class GdhmAiService {
         }
         catch (Exception ex) {
             log.error("Failed while handling Bedrock return control for sessionId={}", sessionId, ex);
-            finishWithVisibleError(sink, fullResponse, ex);
+            finishWithVisibleError(sink, fullResponse, ex, true);
         }
     }
 
@@ -154,6 +155,8 @@ public class GdhmAiService {
         return """
                 Preferred response language: %s.
                 Use this language for the full answer and for tool parameters when supported.
+                For this turn, if the question involves live GDHM data, call the relevant tools again for this specific turn.
+                Do not rely on data retrieved in an earlier turn, even if the conversation is continuing.
 
                 User request:
                 %s
@@ -168,25 +171,35 @@ public class GdhmAiService {
     private void handleInvokeError(InvokeAgentRequest request, Throwable error, FluxSink<String> sink,
                                    String userLanguage, StringBuffer fullResponse, int attemptNumber) {
         String sessionId = request.sessionId();
-        if (shouldRetry(error, fullResponse, attemptNumber)) {
+        Throwable rootCause = unwrap(error);
+        boolean afterToolResults = hasReturnControlResults(request);
+        if (shouldRetry(request, rootCause, fullResponse, attemptNumber)) {
             log.warn("Retrying Bedrock agent sessionId={} after dependency failure attempt={}/{}", sessionId,
-                    attemptNumber, maxModelRetryAttempts, error);
+                    attemptNumber, maxModelRetryAttempts, rootCause);
             invokeAgent(request, sink, userLanguage, fullResponse, attemptNumber + 1);
             return;
         }
 
-        log.error("Bedrock agent invocation failed for sessionId={} on attempt={}", sessionId, attemptNumber, error);
-        finishWithVisibleError(sink, fullResponse, error);
+        log.error("Bedrock agent invocation failed for sessionId={} on attempt={} afterToolResults={} errorType={} message={}",
+                sessionId, attemptNumber, afterToolResults, rootCause.getClass().getSimpleName(),
+                rootCause.getMessage(), rootCause);
+        finishWithVisibleError(sink, fullResponse, rootCause, afterToolResults);
     }
 
-    private boolean shouldRetry(Throwable error, StringBuffer fullResponse, int attemptNumber) {
+    private boolean shouldRetry(InvokeAgentRequest request, Throwable error, StringBuffer fullResponse, int attemptNumber) {
         return error instanceof DependencyFailedException
+                && !hasReturnControlResults(request)
                 && fullResponse.length() == 0
                 && attemptNumber < maxModelRetryAttempts;
     }
 
-    private void finishWithVisibleError(FluxSink<String> sink, StringBuffer fullResponse, Throwable error) {
-        String visibleMessage = userVisibleErrorMessage(error);
+    private boolean hasReturnControlResults(InvokeAgentRequest request) {
+        return request.sessionState() != null && request.sessionState().hasReturnControlInvocationResults();
+    }
+
+    private void finishWithVisibleError(FluxSink<String> sink, StringBuffer fullResponse, Throwable error,
+                                        boolean afterToolResults) {
+        String visibleMessage = userVisibleErrorMessage(error, afterToolResults);
         if (fullResponse.length() > 0) {
             fullResponse.append("\n\n").append(visibleMessage);
         }
@@ -199,11 +212,22 @@ public class GdhmAiService {
         sink.complete();
     }
 
-    private String userVisibleErrorMessage(Throwable error) {
+    private String userVisibleErrorMessage(Throwable error, boolean afterToolResults) {
         if (error instanceof DependencyFailedException) {
+            if (afterToolResults) {
+                return "That request was too broad for the AI to finish reliably after loading the GDHM data. Please narrow it by country, year, category, phase, or region and try again.";
+            }
             return "I'm having trouble getting a response from Bedrock right now. Please try the same question again in a moment.";
         }
         return "I ran into a temporary problem while generating the answer. Please try again.";
+    }
+
+    private Throwable unwrap(Throwable error) {
+        Throwable current = error;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
     }
 
     private void logTracePart(TracePart tracePart) {
