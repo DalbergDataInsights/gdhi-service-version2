@@ -27,5 +27,8 @@ public record BedrockCountrySummaryData(
                 dto.getGovtApproved(),
                 dto.getResources()
         );
+        // TODO: consider using a builderå pattern if the number of parameters grows or if we want to make some of them optional
+        // also consider if we want to include all fields from CountrySummaryDto or if we want to transform some of them differently for the Bedrock response   
+        // for example, we might want to format the summary differently, or include additional computed fields based on the countryPhase or other data.
     }
 }
