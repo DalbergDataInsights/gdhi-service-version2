@@ -27,5 +27,6 @@ public record BedrockCountrySummaryData(
                 dto.getGovtApproved(),
                 dto.getResources()
         );
+        // TODO: consider using a builderå pattern if the number of parameters grows or if we want to make some of them optionalåß
     }
 }
