@@ -109,7 +109,6 @@ jobs:
                       Use the code-reviewer agent (defined in .claude/agents/code-reviewer.md) to review this pull request.
                       ALREADY COMMENTED ON lists previous inline comments as "file:line — comment text".
                       For each entry: if the issue described has been fixed, do not re-comment. If it has NOT been fixed, post a new comment noting it is still unresolved. You may always comment on new lines not in the list.
-                  show_full_output: true
                   claude_args: |
                       --max-turns 30
                       --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Read,Grep,Glob"
