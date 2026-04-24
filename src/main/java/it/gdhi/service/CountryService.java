@@ -18,6 +18,7 @@ import it.gdhi.repository.ICountrySummaryRepository;
 import it.gdhi.utils.LanguageCode;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import static it.gdhi.utils.ApplicationConstants.defaultLimit;
 import static it.gdhi.utils.FormStatus.PUBLISHED;
@@ -26,6 +27,7 @@ import static it.gdhi.utils.Util.*;
 
 
 @Service
+@Transactional(readOnly = true)
 public class CountryService {
 
     private final ICountryRepository iCountryRepository;
