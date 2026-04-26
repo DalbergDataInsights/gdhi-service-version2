@@ -31,6 +31,8 @@ public interface ICountryPhaseRepository extends JpaRepository<CountryPhase, Cou
 
     List<CountryPhase> findByCountryPhaseIdYearAndCountryOverallPhase(String year, Integer countryOverallPhase);
 
+    List<CountryPhase> findByLatestTrueAndCountryOverallPhase(Integer countryOverallPhase);
+
     List<CountryPhase> findByLatestTrueAndCountryPhaseIdCountryIdIn(List<String> countryIds);
 
     @Query(value = """
