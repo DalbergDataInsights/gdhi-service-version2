@@ -28,6 +28,8 @@ public interface ICountryHealthIndicatorRepository extends JpaRepository<Country
 
     List<CountryHealthIndicator> findByCountryHealthIndicatorIdCountryIdInAndCountryHealthIndicatorIdYearInAndStatus(List<String> countryId, List<String> year, String status);
 
+    List<CountryHealthIndicator> findByStatus(String status);
+
     @Query(value = """
             SELECT hi.*
             FROM country_health_data.health_indicators hi

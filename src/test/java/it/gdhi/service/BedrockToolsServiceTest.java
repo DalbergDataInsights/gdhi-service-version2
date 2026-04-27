@@ -16,6 +16,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import software.amazon.awssdk.services.bedrockagentruntime.model.ApiInvocationInput;
+import software.amazon.awssdk.services.bedrockagentruntime.model.ApiParameter;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.never;
@@ -52,13 +56,16 @@ public class BedrockToolsServiceTest {
     @Mock
     private CountryNameTranslator countryNameTranslator;
 
+    @Mock
+    private GdhmAnalyticsService gdhmAnalyticsService;
+
     private BedrockToolsService service;
 
     @BeforeEach
     public void setUp() {
         service = new BedrockToolsService(countryService, countryHealthIndicatorService, regionService,
                 categoryIndicatorService, phaseService, defaultYearDataService, countryPhaseRepository,
-                countryRepository, countryNameTranslator);
+                countryRepository, countryNameTranslator, gdhmAnalyticsService);
     }
 
     @Test
@@ -128,5 +135,23 @@ public class BedrockToolsServiceTest {
         assertEquals(healthScore, response.data());
         verify(countryHealthIndicatorService).fetchLatestCountryHealthScore("KEN", LanguageCode.en);
         verify(defaultYearDataService, never()).fetchDefaultYear();
+    }
+
+    @Test
+    public void shouldDispatchCountryPhaseTrendAnalyticsTool() {
+        ApiInvocationInput input = ApiInvocationInput.builder()
+                .httpMethod("GET")
+                .apiPath("/analytics/country-phase-trends")
+                .parameters(List.of(
+                        ApiParameter.builder().name("regionId").value("African region").type("string").build(),
+                        ApiParameter.builder().name("categoryId").value("1").type("integer").build(),
+                        ApiParameter.builder().name("indicatorId").value("4").type("integer").build(),
+                        ApiParameter.builder().name("direction").value("advanced").type("string").build()))
+                .build();
+
+        service.executeApiInvocation(input);
+
+        verify(gdhmAnalyticsService).analyzeCountryPhaseTrends("AFRO", null, 1, 4, null, null,
+                "advanced", null, null);
     }
 }
