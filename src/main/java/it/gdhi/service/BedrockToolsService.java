@@ -302,7 +302,7 @@ public class BedrockToolsService {
                 "error",
                 "Tool execution failed.",
                 filters(),
-                filters("error", ex.getMessage()),
+                filters("error", "An internal error occurred."),
                 Instant.now()
         );
     }
@@ -348,7 +348,12 @@ public class BedrockToolsService {
         if (!StringUtils.hasText(value)) {
             return null;
         }
-        return Integer.valueOf(value);
+        try {
+            return Integer.valueOf(value);
+        }
+        catch (NumberFormatException ex) {
+            throw new IllegalArgumentException("Invalid integer value for '" + key + "': " + value, ex);
+        }
     }
 
     private List<String> requiredList(Map<String, List<String>> parameters, String key) {

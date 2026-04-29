@@ -54,8 +54,6 @@ info.Description: Application Health Checker
 info.body: pong
 info.status: 200
 aws:
-  accessKey: ${AWS_ACCESS_KEY_ID}
-  secretKey: ${AWS_SECRET_ACCESS_KEY}
   region:  ${AWS_REGION}
   bedrock:
     agentId: ${AWS_BEDROCK_AGENT_ID:}

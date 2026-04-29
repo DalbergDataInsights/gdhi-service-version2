@@ -6,7 +6,8 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
-import static java.util.UUID.randomUUID;
+import javax.validation.constraints.NotBlank;
+import javax.validation.constraints.Size;
 
 @Setter
 @Getter
@@ -14,16 +15,13 @@ import static java.util.UUID.randomUUID;
 @NoArgsConstructor
 
 public class AIRequest {
-   private String responseId;
-   private String query;
-   @JsonProperty("user_language")
-   private String userLanguage;
+    private String responseId;
 
-    public String getResponseId() {
-       if (responseId == null || responseId.isEmpty()){
-           responseId = randomUUID().toString();
-       }
-       return responseId;
-   }
+    @NotBlank
+    @Size(max = 2000)
+    private String query;
 
+    @JsonProperty("user_language")
+    @Size(max = 20)
+    private String userLanguage;
 }
