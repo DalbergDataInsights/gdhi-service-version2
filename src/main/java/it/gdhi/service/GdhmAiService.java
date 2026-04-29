@@ -5,10 +5,8 @@ import it.gdhi.dto.AIRequest;
 import it.gdhi.utils.LanguageCode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
-import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import software.amazon.awssdk.services.bedrockagentruntime.BedrockAgentRuntimeAsyncClient;
@@ -29,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static it.gdhi.utils.LanguageCode.USER_LANGUAGE;
+import static java.util.UUID.randomUUID;
 
 @Slf4j
 @Service
@@ -42,7 +41,8 @@ public class GdhmAiService {
     public Flux<String> streamChat(AIRequest userQuery) {
         String sessionId = Optional.ofNullable(userQuery.getResponseId())
                 .map(String::trim)
-                .orElseThrow(() -> new IllegalArgumentException("Session ID (ResponseId) cannot be null"));
+                .filter(StringUtils::hasText)
+                .orElseGet(() -> randomUUID().toString());
         String query = userQuery.getQuery();
         LanguageCode userLanguage = resolveUserLanguage(userQuery);
 
@@ -53,18 +53,18 @@ public class GdhmAiService {
     }
 
     private void invokeAgent(InvokeAgentRequest request, FluxSink<String> sink, LanguageCode userLanguage,
-                             AtomicBoolean responseStarted, int attemptNumber) {
+                             AtomicBoolean hasEmittedText, int attemptNumber) {
         AtomicReference<ReturnControlPayload> pendingReturnControl = new AtomicReference<>();
 
         InvokeAgentResponseHandler handler = InvokeAgentResponseHandler.builder()
-                .onError(error -> handleInvokeError(request, error, sink, userLanguage, responseStarted, attemptNumber))
+                .onError(error -> handleInvokeError(request, error, sink, userLanguage, hasEmittedText, attemptNumber))
                 .onComplete(() -> continueOrComplete(request.sessionId(), pendingReturnControl.get(), sink,
-                        userLanguage, responseStarted))
+                        userLanguage, hasEmittedText))
                 .subscriber(InvokeAgentResponseHandler.Visitor.builder()
                         .onChunk(chunk -> {
                             String text = chunk.bytes().asUtf8String();
                             if (StringUtils.hasText(text)) {
-                                responseStarted.set(true);
+                                hasEmittedText.set(true);
                                 sink.next(text);
                             }
                         })
@@ -82,7 +82,7 @@ public class GdhmAiService {
     }
 
     private void continueOrComplete(String sessionId, ReturnControlPayload payload, FluxSink<String> sink,
-                                    LanguageCode userLanguage, AtomicBoolean responseStarted) {
+                                    LanguageCode userLanguage, AtomicBoolean hasEmittedText) {
         if (payload == null) {
             log.info("Bedrock agent sessionId={} completed without further return control", sessionId);
             sink.complete();
@@ -94,11 +94,11 @@ public class GdhmAiService {
                     sessionId, payload.invocationId(), payload.invocationInputs().size());
             SessionState sessionState = returnControlService.buildSessionState(payload, userLanguage.name());
             invokeAgent(buildReturnControlRequest(sessionId, sessionState, userLanguage), sink, userLanguage,
-                    responseStarted, 1);
+                    hasEmittedText, 1);
         }
         catch (Exception ex) {
             log.error("Failed while handling Bedrock return control for sessionId={}", sessionId, ex);
-            failWithServerError(sink, "Bedrock return control failed.", ex);
+            finishWithVisibleError(sink, hasEmittedText, ex, true);
         }
     }
 
@@ -163,28 +163,28 @@ public class GdhmAiService {
     }
 
     private void handleInvokeError(InvokeAgentRequest request, Throwable error, FluxSink<String> sink,
-                                   LanguageCode userLanguage, AtomicBoolean responseStarted, int attemptNumber) {
+                                   LanguageCode userLanguage, AtomicBoolean hasEmittedText, int attemptNumber) {
         String sessionId = request.sessionId();
         Throwable rootCause = unwrap(error);
         boolean afterToolResults = hasReturnControlResults(request);
-        if (shouldRetry(request, rootCause, responseStarted, attemptNumber)) {
-            log.warn("Retrying Bedrock agent sessionId={} after dependency failure attempt={}/{}", sessionId,
-                    attemptNumber, bedrockAgentProperties.getMaxModelRetryAttempts(), rootCause);
-            invokeAgent(request, sink, userLanguage, responseStarted, attemptNumber + 1);
+        if (shouldRetry(request, rootCause, hasEmittedText, attemptNumber)) {
+            log.warn("Retrying Bedrock agent sessionId={} after dependency failure attempt={}/{} cause={}", sessionId,
+                    attemptNumber, bedrockAgentProperties.getMaxModelRetryAttempts(), rootCause.getMessage());
+            invokeAgent(request, sink, userLanguage, hasEmittedText, attemptNumber + 1);
             return;
         }
 
         log.error("Bedrock agent invocation failed for sessionId={} on attempt={} afterToolResults={} errorType={} message={}",
                 sessionId, attemptNumber, afterToolResults, rootCause.getClass().getSimpleName(),
                 rootCause.getMessage(), rootCause);
-        failWithServerError(sink, "Bedrock agent invocation failed.", rootCause);
+        finishWithVisibleError(sink, hasEmittedText, rootCause, afterToolResults);
     }
 
-    private boolean shouldRetry(InvokeAgentRequest request, Throwable error, AtomicBoolean responseStarted,
+    private boolean shouldRetry(InvokeAgentRequest request, Throwable error, AtomicBoolean hasEmittedText,
                                 int attemptNumber) {
         return error instanceof DependencyFailedException
                 && !hasReturnControlResults(request)
-                && !responseStarted.get()
+                && !hasEmittedText.get()
                 && attemptNumber < bedrockAgentProperties.getMaxModelRetryAttempts();
     }
 
@@ -192,10 +192,26 @@ public class GdhmAiService {
         return request.sessionState() != null && request.sessionState().hasReturnControlInvocationResults();
     }
 
-    private void failWithServerError(FluxSink<String> sink, String reason, Throwable error) {
+    private void finishWithVisibleError(FluxSink<String> sink, AtomicBoolean hasEmittedText, Throwable error,
+                                        boolean afterToolResults) {
+        String visibleMessage = userVisibleErrorMessage(error, afterToolResults);
         if (!sink.isCancelled()) {
-            sink.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, reason, error));
+            if (hasEmittedText.get()) {
+                sink.next("\n\n");
+            }
+            sink.next(visibleMessage);
         }
+        sink.complete();
+    }
+
+    private String userVisibleErrorMessage(Throwable error, boolean afterToolResults) {
+        if (error instanceof DependencyFailedException) {
+            if (afterToolResults) {
+                return "That request was too broad for the AI to finish reliably after loading the GDHM data. Please narrow it by country, year, category, phase, or region and try again.";
+            }
+            return "I'm having trouble getting a response from Bedrock right now. Please try the same question again in a moment.";
+        }
+        return "I ran into a temporary problem while generating the answer. Please try again.";
     }
 
     private Throwable unwrap(Throwable error) {
