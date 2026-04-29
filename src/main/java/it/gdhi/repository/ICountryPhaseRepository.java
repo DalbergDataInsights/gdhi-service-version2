@@ -27,4 +27,6 @@ public interface ICountryPhaseRepository extends JpaRepository<CountryPhase, Cou
                                                                               List<String> year);
 
     List<CountryPhase> findByCountryPhaseIdCountryIdInAndCountryPhaseIdYear(List<String> countryId, String year);
+
+    List<CountryPhase> findByCountryPhaseIdYearAndCountryOverallPhase(String year, Integer countryOverallPhase);
 }
